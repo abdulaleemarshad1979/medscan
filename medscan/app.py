@@ -2,10 +2,12 @@
 MedScan — Medical Report OCR Web App
 Storage  : Google Sheets via Apps Script Web App URL
 OCR      : OCR.space cloud API
+Supports : Images up to 5MB (auto-compressed before sending to OCR)
 """
 
-import re, os, traceback, base64, requests
+import re, os, traceback, base64, requests, io
 from datetime import datetime
+from PIL import Image
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 
@@ -24,7 +26,7 @@ COLUMNS = [
 ]
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB max upload
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 @app.after_request
@@ -34,8 +36,47 @@ def add_cors(response):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
+# ── Image compression ─────────────────────────────────────────────────────────
+def compress_image(img_bytes: bytes, max_kb: int = 900) -> bytes:
+    """
+    Auto-compress image to stay under max_kb (900KB).
+    OCR.space free tier limit is 1MB — we target 900KB to be safe.
+    Handles camera images up to 5MB.
+    """
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    # If already small enough, return as-is
+    if len(img_bytes) <= max_kb * 1024:
+        return img_bytes
+
+    # Try progressively lower quality until under limit
+    for quality in [85, 75, 65, 55, 45, 35]:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        compressed = buf.getvalue()
+        print(f"[COMPRESS] quality={quality} → {len(compressed)//1024}KB")
+        if len(compressed) <= max_kb * 1024:
+            return compressed
+
+    # Last resort — resize to half dimensions
+    w, h = img.size
+    img  = img.resize((w // 2, h // 2), Image.LANCZOS)
+    buf  = io.BytesIO()
+    img.save(buf, format="JPEG", quality=50, optimize=True)
+    print(f"[COMPRESS] resized to {w//2}x{h//2}")
+    return buf.getvalue()
+
 # ── OCR via ocr.space ─────────────────────────────────────────────────────────
 def ocr_image_bytes(img_bytes: bytes, filename: str) -> str:
+    original_kb = len(img_bytes) // 1024
+    print(f"[OCR] {filename} — original size: {original_kb}KB")
+
+    # Auto-compress if over 900KB
+    if original_kb > 900:
+        print(f"[COMPRESS] Compressing {original_kb}KB image...")
+        img_bytes = compress_image(img_bytes)
+        print(f"[COMPRESS] Final size: {len(img_bytes)//1024}KB")
+
     b64  = base64.b64encode(img_bytes).decode("utf-8")
     ext  = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
     mime = {"png":"image/png","jpg":"image/jpeg","jpeg":"image/jpeg",
