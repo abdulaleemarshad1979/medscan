@@ -38,16 +38,9 @@ def add_cors(response):
 
 # ── Image compression ─────────────────────────────────────────────────────────
 def compress_image(img_bytes: bytes, max_kb: int = 900) -> bytes:
-    """
-    Auto-compress image to stay under max_kb (900KB).
-    OCR.space free tier limit is 1MB — we target 900KB to be safe.
-    Handles camera images up to 10MB.
-    """
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
     if len(img_bytes) <= max_kb * 1024:
         return img_bytes
-
     for quality in [85, 75, 65, 55, 45, 35]:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
@@ -55,8 +48,6 @@ def compress_image(img_bytes: bytes, max_kb: int = 900) -> bytes:
         print(f"[COMPRESS] quality={quality} → {len(compressed)//1024}KB")
         if len(compressed) <= max_kb * 1024:
             return compressed
-
-    # Last resort — resize to half dimensions
     w, h = img.size
     img  = img.resize((w // 2, h // 2), Image.LANCZOS)
     buf  = io.BytesIO()
@@ -68,12 +59,10 @@ def compress_image(img_bytes: bytes, max_kb: int = 900) -> bytes:
 def ocr_image_bytes(img_bytes: bytes, filename: str) -> str:
     original_kb = len(img_bytes) // 1024
     print(f"[OCR] {filename} — original size: {original_kb}KB")
-
     if original_kb > 900:
         print(f"[COMPRESS] Compressing {original_kb}KB image...")
         img_bytes = compress_image(img_bytes)
         print(f"[COMPRESS] Final size: {len(img_bytes)//1024}KB")
-
     b64  = base64.b64encode(img_bytes).decode("utf-8")
     ext  = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
     mime = {"png":"image/png","jpg":"image/jpeg","jpeg":"image/jpeg",
@@ -93,7 +82,7 @@ def ocr_image_bytes(img_bytes: bytes, filename: str) -> str:
     if data.get("IsErroredOnProcessing"):
         raise ValueError(data.get("ErrorMessage", ["OCR failed"])[0])
     raw = " ".join(r.get("ParsedText","") for r in (data.get("ParsedResults") or []))
-    print(f"[OCR RAW TEXT]: {raw[:600]}")  # debug first 600 chars
+    print(f"[OCR RAW TEXT]:\n{raw}\n{'─'*60}")
     return raw
 
 # ── Apps Script helpers ───────────────────────────────────────────────────────
@@ -120,10 +109,7 @@ def find(pattern, text, group=1):
     return m.group(group).strip() if m else None
 
 def clean_name(raw: str) -> str:
-    """
-    Remove trailing noise from patient name.
-    Handles OCR artifacts like: "MD.SAZID AVI DATE : 10.05.202"
-    """
+    """Remove trailing date/ID noise from patient name."""
     if not raw:
         return raw
     # Cut at known trailing noise keywords
@@ -134,6 +120,15 @@ def clean_name(raw: str) -> str:
     # Remove trailing digits / punctuation (stray date fragments)
     raw = re.sub(r'[\s\d:./\-]+$', '', raw)
     return raw.strip()
+
+def normalize_gender(raw: str) -> str:
+    """Convert M/F/Male/Female variants to standard Male/Female."""
+    if not raw:
+        return None
+    g = raw.strip().upper()
+    if g in ("M", "MALE"):   return "Male"
+    if g in ("F", "FEMALE"): return "Female"
+    return None   # reject anything else (e.g. "Biochemistry")
 
 def is_handwritten_table(text):
     has_label    = bool(re.search(r'Patient\s*Name\s*:', text, re.IGNORECASE))
@@ -177,22 +172,23 @@ def extract_handwritten(text):
 
 def extract(text):
     """
-    Universal extractor — handles multiple real-world lab report formats:
+    Universal extractor — handles multiple real-world lab report formats.
 
-    Format A  (Apollo/structured digital report):
+    Format A  (Apollo/structured digital):
         Patient Name: Mohammed Abdul Kareem   Age / Gender: 42 Years / Male
         Blood Pressure (Systolic)  142 mmHg
         Fasting Blood Glucose      128 mg/dL
 
     Format B  (Surya Clinical / basic printed lab slip):
-        PATIENT NAME : MD.SAZID AVI
-        AGE : 45   SEX : M
+        PATIENT NAME : MD.SAZID AVI    AGE : 45   SEX : M
+        BIOCHEMISTRY
         BLOOD SUGAR (F)  :  178  Mg/dl
         BLOOD SUGAR (PP) :  234  Mg/dl
 
-    Format C  (inline key-value):
+    Format C  (generic key-value):
         Patient Name: XYZ   Age: 35   Gender: Male
         Systolic BP: 130   Diastolic BP: 85
+        Fasting Sugar: 110   Post Prandial: 165
     """
     f = {}
 
@@ -212,17 +208,20 @@ def extract(text):
     )
 
     # ── Gender ───────────────────────────────────────────────────────────────
-    raw_gender = (
-        find(r'SEX\s*[:\-]\s*([A-Za-z]+)', text) or
-        find(r'Gender\s*[:\-]\s*([A-Za-z]+)', text) or
-        find(r'\d+\s*(?:Years?|Yrs?)?\s*/\s*(Male|Female)', text, group=1) or
-        find(r'\b(Male|Female)\b', text)
-    )
-    if raw_gender:
-        g = raw_gender.strip().upper()
-        f["Gender"] = "Male" if g in ("M", "MALE") else "Female" if g in ("F", "FEMALE") else raw_gender.title()
-    else:
-        f["Gender"] = None
+    # IMPORTANT: Only accept strict Male/Female/M/F — reject section headings
+    # Try in order: SEX field → Gender field → inline "42 Years / Male"
+    gender_candidates = [
+        find(r'SEX\s*[:\-]\s*([A-Za-z]+)', text),
+        find(r'Gender\s*[:\-]\s*([A-Za-z]+)', text),
+        find(r'\d+\s*(?:Years?|Yrs?)?\s*/\s*(Male|Female)\b', text),
+        find(r'\b(Male|Female)\b', text),
+    ]
+    f["Gender"] = None
+    for candidate in gender_candidates:
+        result = normalize_gender(candidate)
+        if result:
+            f["Gender"] = result
+            break
 
     # ── Anthropometry ─────────────────────────────────────────────────────────
     f["Height (cm)"] = (
@@ -236,7 +235,6 @@ def extract(text):
     f["BMI"] = find(r'BMI[^\d\n]{0,20}(\d{1,2}\.\d+)', text)
 
     # ── Blood Pressure ────────────────────────────────────────────────────────
-    # First attempt: explicit systolic/diastolic labels
     sys_val = (
         find(r'Blood\s+Pressure\s+\(Systolic\)\s+(\d{2,3})', text) or
         find(r'Systolic\s*(?:BP|Blood\s*Pressure)?\s*[:\-]?\s*(\d{2,3})', text)
@@ -245,12 +243,9 @@ def extract(text):
         find(r'Blood\s+Pressure\s+\(Diastolic\)\s+(\d{2,3})', text) or
         find(r'Diastolic\s*(?:BP|Blood\s*Pressure)?\s*[:\-]?\s*(\d{2,3})', text)
     )
-    # Fallback: "NNN/NNN mmHg" slash notation — only if both look like real BP
+    # Fallback: "NNN/NNN mmHg" slash notation
     if not sys_val or not dia_val:
-        bp_slash = re.search(
-            r'\b(\d{2,3})\s*/\s*(\d{2,3})\s*(?:mmHg|mm\s*Hg)?',
-            text, re.IGNORECASE
-        )
+        bp_slash = re.search(r'\b(\d{2,3})\s*/\s*(\d{2,3})\s*(?:mmHg|mm\s*Hg)?', text, re.IGNORECASE)
         if bp_slash:
             s, d = int(bp_slash.group(1)), int(bp_slash.group(2))
             if 80 <= s <= 250 and 40 <= d <= 150:
@@ -261,21 +256,25 @@ def extract(text):
     f["Diastolic BP"] = dia_val
 
     # ── Blood Sugar ───────────────────────────────────────────────────────────
-    # Format B: BLOOD SUGAR (F)  /  BLOOD SUGAR (PP)
-    # Format A: Fasting Blood Glucose  /  Post Prandial Glucose
-    # Format C: Fasting Sugar  /  Post Prandial Sugar / PPBS
+    # Priority 1: Surya-style "BLOOD SUGAR (F)" and "BLOOD SUGAR (PP)"
+    # Priority 2: Apollo-style "Fasting Blood Glucose"
+    # Priority 3: Generic "Fasting Sugar"
+    # The OCR often collapses "BLOOD" into "LOOD" when left edge is cut — handle that too
 
     f["Fasting Sugar (mg/dL)"] = (
-        find(r'BLOOD\s+SUGAR\s*[\(\[]\s*F\s*[\)\]]\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
+        find(r'(?:B?LOOD\s+SUGAR|BS)\s*[\(\[]\s*F\s*[\)\]]\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
         find(r'(?:Fasting|FBS|F\.?B\.?S\.?)\s*(?:Blood\s*)?(?:Sugar|Glucose)\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
         find(r'Fasting\s+Blood\s+Glucose\s+(\d{2,3}(?:\.\d)?)', text) or
-        find(r'Fasting\s+Sugar\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text)
+        find(r'Fasting\s+Sugar\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
+        find(r'SUGAR\s*[\(\[]\s*F\s*[\)\]]\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text)
     )
+
     f["Post Prandial Sugar (mg/dL)"] = (
-        find(r'BLOOD\s+SUGAR\s*[\(\[]\s*PP\s*[\)\]]\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
+        find(r'(?:B?LOOD\s+SUGAR|BS)\s*[\(\[]\s*PP\s*[\)\]]\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
         find(r'(?:Post\s*Prandial|PPBS|PP\.?B\.?S\.?)\s*(?:Blood\s*)?(?:Sugar|Glucose)?\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
-        find(r'Post\s+Prandial\s+Glucose\s+(\d{2,3}(?:\.\d)?)', text) or
-        find(r'Post\s+Prandial\s+Sugar\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text)
+        find(r'Post\s+Prandial\s+(?:Blood\s+)?Glucose\s+(\d{2,3}(?:\.\d)?)', text) or
+        find(r'Post\s+Prandial\s+Sugar\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text) or
+        find(r'SUGAR\s*[\(\[]\s*PP\s*[\)\]]\s*[:\-]?\s*(\d{2,3}(?:\.\d)?)', text)
     )
 
     print(f"[EXTRACT] {f}")
